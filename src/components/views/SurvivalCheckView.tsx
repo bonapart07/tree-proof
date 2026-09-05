@@ -5,7 +5,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import confetti from 'canvas-confetti';
 import { soundManager } from '@/lib/sound';
 import { db, collection, query, orderBy, onSnapshot, unlockTreeTokensInFirestore } from '@/lib/firebase';
-import { verify30DaySurvivalWithGemini, GeminiSurvivalResult } from '@/lib/geminiVision';
+import { verify30DaySurvivalWithGemini, GeminiSurvivalResult, compressImageDataUrl } from '@/lib/geminiVision';
 import { reverseGeocodeCoords } from '@/lib/geocoding';
 import {
   Calendar,
@@ -155,7 +155,7 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
       const ctx = canvas.getContext('2d');
       if (ctx) {
         ctx.drawImage(videoRef.current, 0, 0);
-        setDay30Photo(canvas.toDataURL('image/jpeg'));
+        setDay30Photo(canvas.toDataURL('image/jpeg', 0.75));
         setUseCamera(false);
         soundManager.playLeafHover();
       }
@@ -166,9 +166,11 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
     const file = e.target.files?.[0];
     if (file) {
       const reader = new FileReader();
-      reader.onload = (ev) => {
+      reader.onload = async (ev) => {
         if (ev.target?.result) {
-          setDay30Photo(ev.target.result as string);
+          const raw = ev.target.result as string;
+          const compressed = await compressImageDataUrl(raw, 640, 0.75);
+          setDay30Photo(compressed);
           soundManager.playLeafHover();
         }
       };

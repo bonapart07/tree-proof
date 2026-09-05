@@ -45,53 +45,61 @@ function cleanBase64(dataUrl: string): { mimeType: string; data: string } {
 }
 
 /**
+ * High-speed client-side image compressor for instant verification uploads (< 50KB).
+ * Reduces multi-megabyte camera photos into lightweight, highly detailed 640px images
+ * so that AI multimodal inference and Firestore storage complete in seconds.
+ */
+export async function compressImageDataUrl(
+  dataUrl: string,
+  maxDimension = 640,
+  quality = 0.75
+): Promise<string> {
+  if (!dataUrl) return '';
+  if (typeof window === 'undefined' || !dataUrl.startsWith('data:image')) {
+    return dataUrl;
+  }
+
+  return new Promise<string>((resolve) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      let { width, height } = img;
+      if (width > maxDimension || height > maxDimension) {
+        if (width > height) {
+          height = Math.round((height * maxDimension) / width);
+          width = maxDimension;
+        } else {
+          width = Math.round((width * maxDimension) / height);
+          height = maxDimension;
+        }
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        resolve(dataUrl);
+        return;
+      }
+      ctx.drawImage(img, 0, 0, width, height);
+      resolve(canvas.toDataURL('image/jpeg', quality));
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
+
+/**
  * Optimize image for Gemini Multimodal Vision API.
- * Resizes images down to a maximum dimension of 1024px to guarantee sub-second
- * upload and avoid 413 Payload Too Large limits on high-res camera uploads.
+ * Uses 640px at 0.75 quality for blazing-fast network transfer and instant AI evaluation.
  */
 async function prepareImageForGemini(
   dataUrl: string,
-  maxDimension = 1024
+  maxDimension = 640
 ): Promise<{ mimeType: string; data: string }> {
   if (!dataUrl) return { mimeType: 'image/jpeg', data: '' };
-
-  if (typeof window !== 'undefined' && dataUrl.startsWith('data:image')) {
-    try {
-      const optimized = await new Promise<string>((resolve) => {
-        const img = new Image();
-        img.crossOrigin = 'anonymous';
-        img.onload = () => {
-          let { width, height } = img;
-          if (width > maxDimension || height > maxDimension) {
-            if (width > height) {
-              height = Math.round((height * maxDimension) / width);
-              width = maxDimension;
-            } else {
-              width = Math.round((width * maxDimension) / height);
-              height = maxDimension;
-            }
-          }
-          const canvas = document.createElement('canvas');
-          canvas.width = width;
-          canvas.height = height;
-          const ctx = canvas.getContext('2d');
-          if (!ctx) {
-            resolve(dataUrl);
-            return;
-          }
-          ctx.drawImage(img, 0, 0, width, height);
-          resolve(canvas.toDataURL('image/jpeg', 0.85));
-        };
-        img.onerror = () => resolve(dataUrl);
-        img.src = dataUrl;
-      });
-      return cleanBase64(optimized);
-    } catch {
-      return cleanBase64(dataUrl);
-    }
-  }
-
-  return cleanBase64(dataUrl);
+  const compressed = await compressImageDataUrl(dataUrl, maxDimension, 0.75);
+  return cleanBase64(compressed);
 }
 
 /**
@@ -236,20 +244,23 @@ export async function analyzeImagePixelChlorophyll(dataUrl: string): Promise<{
 // Active Gemini Vision Models in Priority Order
 const GEMINI_MODELS = [
   'gemini-3.1-flash-lite',
-  'gemini-2.5-flash',
   'gemini-flash-latest'
 ];
 
 /**
  * Universal helper to call Google Gemini GenerateContent API across active models
+ * with strict per-model timeout so verification completes in seconds
  */
 async function callGeminiVision(apiKey: string, contents: any[]): Promise<any | null> {
   for (const model of GEMINI_MODELS) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000); // 8s timeout max per model
     try {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           contents,
           generationConfig: {
@@ -258,6 +269,7 @@ async function callGeminiVision(apiKey: string, contents: any[]): Promise<any | 
           }
         })
       });
+      clearTimeout(timeout);
 
       if (res.ok) {
         const data = await res.json();
@@ -274,8 +286,9 @@ async function callGeminiVision(apiKey: string, contents: any[]): Promise<any | 
         const errText = await res.text();
         console.warn(`Gemini model ${model} response notice (${res.status}):`, errText);
       }
-    } catch (err) {
-      console.warn(`Gemini model ${model} fetch notice:`, err);
+    } catch (err: any) {
+      clearTimeout(timeout);
+      console.warn(`Gemini model ${model} fetch notice:`, err?.message || err);
     }
   }
   return null;
@@ -353,18 +366,22 @@ Respond strictly in valid JSON matching this schema:
     try {
       const parts: any[] = [{ text: prompt }];
 
-      if (params.layer1Base64 && params.layer1Base64.startsWith('data:')) {
-        const img1 = await prepareImageForGemini(params.layer1Base64);
-        parts.push({ inlineData: { mimeType: img1.mimeType, data: img1.data } });
-      }
-      if (params.layer2Base64 && params.layer2Base64.startsWith('data:')) {
-        const img2 = await prepareImageForGemini(params.layer2Base64);
-        parts.push({ inlineData: { mimeType: img2.mimeType, data: img2.data } });
-      }
-      if (params.layer3Base64 && params.layer3Base64.startsWith('data:')) {
-        const img3 = await prepareImageForGemini(params.layer3Base64);
-        parts.push({ inlineData: { mimeType: img3.mimeType, data: img3.data } });
-      }
+      // Prepare all 3 images in parallel with lightweight 640px compression for ultra-fast processing
+      const [img1, img2, img3] = await Promise.all([
+        params.layer1Base64 && params.layer1Base64.startsWith('data:')
+          ? prepareImageForGemini(params.layer1Base64)
+          : Promise.resolve(null),
+        params.layer2Base64 && params.layer2Base64.startsWith('data:')
+          ? prepareImageForGemini(params.layer2Base64)
+          : Promise.resolve(null),
+        params.layer3Base64 && params.layer3Base64.startsWith('data:')
+          ? prepareImageForGemini(params.layer3Base64)
+          : Promise.resolve(null)
+      ]);
+
+      if (img1) parts.push({ inlineData: { mimeType: img1.mimeType, data: img1.data } });
+      if (img2) parts.push({ inlineData: { mimeType: img2.mimeType, data: img2.data } });
+      if (img3) parts.push({ inlineData: { mimeType: img3.mimeType, data: img3.data } });
 
       const aiResult = await callGeminiVision(apiKey, [{ parts }]);
       if (aiResult && typeof aiResult.plantDetected === 'boolean') {
@@ -482,14 +499,18 @@ Respond strictly in valid JSON matching this schema:
     try {
       const parts: any[] = [{ text: prompt }];
 
-      if (params.day0BaselinePhoto && params.day0BaselinePhoto.startsWith('data:')) {
-        const img0 = await prepareImageForGemini(params.day0BaselinePhoto);
-        parts.push({ inlineData: { mimeType: img0.mimeType, data: img0.data } });
-      }
-      if (params.day30NewPhoto && params.day30NewPhoto.startsWith('data:')) {
-        const img30 = await prepareImageForGemini(params.day30NewPhoto);
-        parts.push({ inlineData: { mimeType: img30.mimeType, data: img30.data } });
-      }
+      // Prepare baseline and day 30 images in parallel with lightweight 640px compression
+      const [img0, img30] = await Promise.all([
+        params.day0BaselinePhoto && params.day0BaselinePhoto.startsWith('data:')
+          ? prepareImageForGemini(params.day0BaselinePhoto)
+          : Promise.resolve(null),
+        params.day30NewPhoto && params.day30NewPhoto.startsWith('data:')
+          ? prepareImageForGemini(params.day30NewPhoto)
+          : Promise.resolve(null)
+      ]);
+
+      if (img0) parts.push({ inlineData: { mimeType: img0.mimeType, data: img0.data } });
+      if (img30) parts.push({ inlineData: { mimeType: img30.mimeType, data: img30.data } });
 
       const aiResult = await callGeminiVision(apiKey, [{ parts }]);
       if (aiResult && typeof aiResult.isAlive === 'boolean') {

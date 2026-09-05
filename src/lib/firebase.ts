@@ -177,8 +177,17 @@ export async function recordTreeToFirestore(treeData: {
 }) {
   try {
     const treesRef = collection(db, 'trees');
-    const docRef = await addDoc(treesRef, {
+
+    // Protect document size: ensure proof photos stay strictly within Firestore 1MB document limit
+    const safeProofPhotos = {
+      layer1Soil: treeData.proofPhotos?.layer1Soil?.slice(0, 250000) || '',
+      layer2Planting: treeData.proofPhotos?.layer2Planting?.slice(0, 250000) || '',
+      layer3Planted: treeData.proofPhotos?.layer3Planted?.slice(0, 250000) || ''
+    };
+
+    const addPromise = addDoc(treesRef, {
       ...treeData,
+      proofPhotos: safeProofPhotos,
       lockedTokens: treeData.lockedTokens ?? 20,
       unlockedTokens: treeData.unlockedTokens ?? 0,
       tokenStatus: treeData.tokenStatus || 'LOCKED_UNTIL_DAY30_VERIFICATION',
@@ -187,9 +196,16 @@ export async function recordTreeToFirestore(treeData: {
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp()
     });
-    return docRef.id;
+
+    // 5-second race timeout so background network delays never freeze the UI
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Firestore record timeout')), 5000)
+    );
+
+    const docRef: any = await Promise.race([addPromise, timeoutPromise]);
+    return docRef?.id || null;
   } catch (err) {
-    console.warn('Firestore tree record warning:', err);
+    console.warn('Firestore tree record notice (handled):', err);
     return null;
   }
 }

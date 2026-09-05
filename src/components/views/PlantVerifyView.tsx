@@ -9,7 +9,7 @@ import AuthModal from '@/components/ui/AuthModal';
 import { COMPREHENSIVE_SPECIES_LIST, SpeciesItem } from '@/lib/speciesData';
 import { generateDeviceFingerprint, DeviceTelemetry } from '@/lib/deviceFingerprint';
 import { reverseGeocodeCoords } from '@/lib/geocoding';
-import { verifyPlantationWithGemini, analyzeImagePixelChlorophyll } from '@/lib/geminiVision';
+import { verifyPlantationWithGemini, analyzeImagePixelChlorophyll, compressImageDataUrl } from '@/lib/geminiVision';
 import {
   Camera,
   MapPin,
@@ -266,7 +266,7 @@ export default function PlantVerifyView({ onEarnPoints, onNavigate, currentUser:
       const ctx = canvas.getContext('2d');
       if (ctx) {
         ctx.drawImage(videoRef.current, 0, 0);
-        const dataUrl = canvas.toDataURL('image/jpeg');
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.75);
 
         if (activeProofLayer === 1) setProofPhotos((p) => ({ ...p, layer1Soil: dataUrl }));
         else if (activeProofLayer === 2) setProofPhotos((p) => ({ ...p, layer2Planting: dataUrl }));
@@ -287,12 +287,14 @@ export default function PlantVerifyView({ onEarnPoints, onNavigate, currentUser:
     const file = e.target.files?.[0];
     if (file) {
       const reader = new FileReader();
-      reader.onload = (ev) => {
+      reader.onload = async (ev) => {
         if (ev.target?.result) {
-          const res = ev.target.result as string;
-          if (layer === 1) setProofPhotos((p) => ({ ...p, layer1Soil: res }));
-          else if (layer === 2) setProofPhotos((p) => ({ ...p, layer2Planting: res }));
-          else if (layer === 3) setProofPhotos((p) => ({ ...p, layer3Planted: res }));
+          const raw = ev.target.result as string;
+          // Instant client-side compression to ~40KB so memory and network remain blazing fast
+          const compressed = await compressImageDataUrl(raw, 640, 0.75);
+          if (layer === 1) setProofPhotos((p) => ({ ...p, layer1Soil: compressed }));
+          else if (layer === 2) setProofPhotos((p) => ({ ...p, layer2Planting: compressed }));
+          else if (layer === 3) setProofPhotos((p) => ({ ...p, layer3Planted: compressed }));
           soundManager.playLeafHover();
         }
       };
@@ -458,11 +460,14 @@ export default function PlantVerifyView({ onEarnPoints, onNavigate, currentUser:
       };
 
       setGeneratedTree(newTreeRecord);
-      await recordTreeToFirestore(newTreeRecord);
-
       soundManager.playVerifyChime();
       setIsScanning(false);
       setCurrentStep(5);
+
+      // Asynchronously record to Firestore in background without blocking UI
+      recordTreeToFirestore(newTreeRecord).catch((err) => {
+        console.warn('Background Firestore tree record notice:', err);
+      });
     } catch (err) {
       console.error('Real AI verification error:', err);
       setIsScanning(false);
