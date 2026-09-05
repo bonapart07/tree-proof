@@ -43,21 +43,6 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
   const [selectedTreeIndex, setSelectedTreeIndex] = useState(0);
   const [forceTestMode, setForceTestMode] = useState(false);
 
-  // Gemini API Key State
-  const [geminiApiKey, setGeminiApiKey] = useState<string>(() => {
-    if (typeof window !== 'undefined') {
-      return (
-        localStorage.getItem('greenproof_gemini_api_key') ||
-        process.env.NEXT_PUBLIC_GEMINI_API_KEY ||
-        ''
-      );
-    }
-    return process.env.NEXT_PUBLIC_GEMINI_API_KEY || '';
-  });
-  const [apiKeyInputVal, setApiKeyInputVal] = useState<string>('');
-  const [showApiKeyConfig, setShowApiKeyConfig] = useState(false);
-  const [apiKeySavedMsg, setApiKeySavedMsg] = useState<string | null>(null);
-
   // Day 30 Evidence Photo (Starts empty in production, requires real camera/upload)
   const [day30Photo, setDay30Photo] = useState<string>('');
   const [useCamera, setUseCamera] = useState(false);
@@ -218,20 +203,6 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
     }
   };
 
-  const handleSaveApiKey = () => {
-    const trimmed = apiKeyInputVal.trim();
-    if (trimmed) {
-      localStorage.setItem('greenproof_gemini_api_key', trimmed);
-      setGeminiApiKey(trimmed);
-      setApiKeySavedMsg('Gemini Vision API Key saved!');
-    } else {
-      localStorage.removeItem('greenproof_gemini_api_key');
-      setGeminiApiKey('');
-      setApiKeySavedMsg('API key cleared.');
-    }
-    setTimeout(() => setApiKeySavedMsg(null), 3000);
-  };
-
   const handleExecuteSurvivalAudit = async () => {
     if (!day30Photo) {
       soundManager.playScanTick();
@@ -256,8 +227,7 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
         latitude: currentGps.latitude,
         longitude: currentGps.longitude,
         altitude: currentGps.altitude
-      },
-      customApiKey: geminiApiKey
+      }
     });
 
     setAuditResult(result);
@@ -327,50 +297,29 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
         </p>
       </div>
 
-      {/* Gemini API Key Bar */}
-      <div className="p-3 sm:p-3.5 rounded-2xl glass-panel border border-emerald-500/20 max-w-4xl mx-auto font-mono text-xs flex flex-wrap items-center justify-between gap-2.5 sm:gap-3 bg-black/50">
-        <div className="flex items-center gap-2 text-slate-300">
-          <Key className="w-4 h-4 text-emerald-400 shrink-0" />
-          <span className="font-bold">Gemini Vision AI Engine:</span>
-          {geminiApiKey ? (
-            <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] border border-emerald-500/30">
-              🟢 API Key Active
-            </span>
-          ) : (
-            <span className="px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-[10px] border border-amber-500/30">
-              Local Spectral Analysis Active
-            </span>
-          )}
-        </div>
-
-        <button
-          onClick={() => setShowApiKeyConfig(!showApiKeyConfig)}
-          className="text-emerald-400 hover:underline text-[11px] cursor-pointer"
-        >
-          {showApiKeyConfig ? 'Close Key Setup' : geminiApiKey ? 'Change Key' : '+ Enter Gemini API Key'}
-        </button>
-
-        {showApiKeyConfig && (
-          <div className="w-full pt-2 border-t border-white/10 flex gap-2">
-            <input
-              type="password"
-              placeholder="AIzaSy..."
-              value={apiKeyInputVal}
-              onChange={(e) => setApiKeyInputVal(e.target.value)}
-              className="flex-1 px-3 py-1.5 rounded-xl bg-black/70 border border-white/15 text-white text-xs font-mono outline-none"
-            />
-            <button
-              onClick={handleSaveApiKey}
-              className="px-3 py-1.5 rounded-xl bg-emerald-500 text-black font-bold text-xs cursor-pointer"
-            >
-              Save Key
-            </button>
+      {/* Real-Time Google Gemini Vision Engine Active Status */}
+      <div className="p-3.5 sm:p-4 rounded-2xl glass-panel border border-emerald-500/30 max-w-4xl mx-auto font-mono text-xs flex flex-wrap items-center justify-between gap-3 bg-black/60 shadow-lg shadow-emerald-950/20">
+        <div className="flex items-center gap-2.5 text-slate-200">
+          <div className="w-8 h-8 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
+            <Sparkles className="w-4 h-4 animate-pulse" />
           </div>
-        )}
-
-        {apiKeySavedMsg && (
-          <div className="w-full text-[11px] text-emerald-300">{apiKeySavedMsg}</div>
-        )}
+          <div>
+            <div className="flex items-center gap-2">
+              <span className="font-bold text-white">Google Gemini 3.1 Vision Neural Engine</span>
+              <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[10px] font-semibold border border-emerald-500/40 flex items-center gap-1.5">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
+                <span>Real-Time AI Active</span>
+              </span>
+            </div>
+            <p className="text-[11px] text-slate-400 font-sans mt-0.5">
+              Automated 30-day longitudinal growth & survival analysis using system credentials
+            </p>
+          </div>
+        </div>
+        <div className="flex items-center gap-2 text-emerald-400 text-[11px] bg-emerald-950/50 px-3 py-1.5 rounded-xl border border-emerald-500/20">
+          <ShieldCheck className="w-3.5 h-3.5" />
+          <span>Geodetic & Spectral Re-Verification</span>
+        </div>
       </div>
 
       {/* Tree Selector Ribbon from Real Planted History (Horizontally swipeable on mobile) */}
