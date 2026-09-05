@@ -5,8 +5,8 @@ import { motion, AnimatePresence } from 'framer-motion';
 import confetti from 'canvas-confetti';
 import { soundManager } from '@/lib/sound';
 import { db, collection, query, orderBy, onSnapshot, unlockTreeTokensInFirestore } from '@/lib/firebase';
+import { getLocalTrees, mergeTreesWithLocal, updateLocalTree, StoredTree } from '@/lib/treeStorage';
 import { verify30DaySurvivalWithGemini, GeminiSurvivalResult, compressImageDataUrl } from '@/lib/geminiVision';
-import { reverseGeocodeCoords } from '@/lib/geocoding';
 import {
   Calendar,
   Sparkles,
@@ -25,7 +25,9 @@ import {
   RefreshCw,
   Award,
   Sprout,
-  Key
+  Clock,
+  ChevronDown,
+  Check
 } from 'lucide-react';
 
 interface SurvivalCheckViewProps {
@@ -37,13 +39,19 @@ interface SurvivalCheckViewProps {
 const DEFAULT_TREE_FALLBACK = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='800' height='600' viewBox='0 0 800 600'%3E%3Crect width='800' height='600' fill='%2306140d'/%3E%3Ccircle cx='400' cy='300' r='120' fill='%2310b981' opacity='0.15'/%3E%3Cpath d='M400 180c-55 0-100 45-100 100 0 35 18 66 45 84v56h110v-56c27-18 45-49 45-84 0-55-45-100-100-100zm-10 180v40h20v-40h-20z' fill='%2310b981'/%3E%3Ctext x='400' y='460' font-family='monospace' font-size='20' fill='%236ee7b7' text-anchor='middle'%3EFIELD BOTANICAL SPECIMEN%3C/text%3E%3C/svg%3E";
 
 export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNavigate }: SurvivalCheckViewProps) {
-  // Real Firestore Trees State
-  const [realTrees, setRealTrees] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
+  // Real Local & Firestore Trees State
+  const [realTrees, setRealTrees] = useState<StoredTree[]>(() => {
+    if (typeof window !== 'undefined') {
+      return getLocalTrees();
+    }
+    return [];
+  });
+  const [loading, setLoading] = useState(false);
   const [selectedTreeIndex, setSelectedTreeIndex] = useState(0);
   const [forceTestMode, setForceTestMode] = useState(false);
+  const [currentTime, setCurrentTime] = useState<number>(Date.now());
 
-  // Day 30 Evidence Photo (Starts empty in production, requires real camera/upload)
+  // Day 30 Evidence Photo
   const [day30Photo, setDay30Photo] = useState<string>('');
   const [useCamera, setUseCamera] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -64,48 +72,70 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
   });
   const [isGpsLoading, setIsGpsLoading] = useState(false);
 
-  // Listen to real trees from Firestore
+  // Live 1-second ticking clock for real-time 30-day countdown
   useEffect(() => {
+    const timer = setInterval(() => {
+      setCurrentTime(Date.now());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Listen to both local storage updates and Firestore
+  useEffect(() => {
+    // 1. Initial load from local storage
+    const local = getLocalTrees();
+    if (local.length > 0) {
+      setRealTrees(local);
+    }
+
+    // 2. Custom event listener for instant updates from Plant & Verify
+    const handleTreesUpdated = () => {
+      const updated = getLocalTrees();
+      setRealTrees(mergeTreesWithLocal(updated));
+    };
+    window.addEventListener('greenproof_trees_updated', handleTreesUpdated);
+
+    // 3. Firestore live subscription
+    let unsubscribe = () => {};
     try {
       const q = query(collection(db, 'trees'), orderBy('createdAt', 'desc'));
-      const unsubscribe = onSnapshot(
+      unsubscribe = onSnapshot(
         q,
         (snapshot) => {
-          let deletedIds: string[] = [];
-          if (typeof window !== 'undefined') {
-            try {
-              const stored = localStorage.getItem('greenproof_deleted_trees');
-              deletedIds = stored ? JSON.parse(stored) : [];
-            } catch (e) {}
+          let firestoreList: any[] = [];
+          if (!snapshot.empty) {
+            firestoreList = snapshot.docs.map((d) => ({ id: d.id, ...d.data() }));
           }
-
-          const fetched = snapshot.docs
-            .map((d) => ({ id: d.id, ...d.data() }))
-            .filter((t: any) => !deletedIds.includes(t.id) && !deletedIds.includes(t.code));
-
-          setRealTrees(fetched);
+          const merged = mergeTreesWithLocal(firestoreList);
+          setRealTrees(merged);
           setLoading(false);
-
-          // If selectedTreeCode prop was passed, find its index
-          if (selectedTreeCode) {
-            const foundIdx = fetched.findIndex((t: any) => t.code === selectedTreeCode);
-            if (foundIdx !== -1) {
-              setSelectedTreeIndex(foundIdx);
-              setForceTestMode(true); // fast-forward testing mode if navigated from tree card
-            }
-          }
         },
-        (err) => {
+        () => {
           setLoading(false);
         }
       );
-      return () => unsubscribe();
-    } catch (e) {
+    } catch {
       setLoading(false);
     }
-  }, [selectedTreeCode]);
 
-  const selectedTree = realTrees[selectedTreeIndex] || realTrees[0] || null;
+    return () => {
+      window.removeEventListener('greenproof_trees_updated', handleTreesUpdated);
+      unsubscribe();
+    };
+  }, []);
+
+  // Sync selectedTreeIndex when selectedTreeCode prop changes or trees change
+  useEffect(() => {
+    if (selectedTreeCode && realTrees.length > 0) {
+      const foundIdx = realTrees.findIndex((t) => t.code === selectedTreeCode);
+      if (foundIdx !== -1) {
+        setSelectedTreeIndex(foundIdx);
+      }
+    }
+  }, [selectedTreeCode, realTrees]);
+
+  const selectedTree: StoredTree | null =
+    realTrees[selectedTreeIndex] || (realTrees.length > 0 ? realTrees[0] : null);
 
   // Baseline Altitude & GPS from selected tree
   const baselineAltitude = selectedTree?.altitude || 54.0;
@@ -114,6 +144,25 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
     longitude: selectedTree?.coordinates?.[1] || 91.7362,
     altitude: baselineAltitude
   };
+
+  // 30 Days in Milliseconds: 30 * 24 * 60 * 60 * 1000 = 2,592,000,000 ms
+  const VESTING_DURATION_MS = 30 * 24 * 60 * 60 * 1000;
+  const plantedTimestamp =
+    selectedTree?.plantedAt ||
+    (selectedTree?.plantedDate ? new Date(selectedTree.plantedDate).getTime() : currentTime);
+  const targetUnlockTimestamp = plantedTimestamp + VESTING_DURATION_MS;
+  const remainingMs = Math.max(0, targetUnlockTimestamp - currentTime);
+
+  const daysLeft = Math.floor(remainingMs / (1000 * 60 * 60 * 24));
+  const hoursLeft = Math.floor((remainingMs % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60));
+  const minutesLeft = Math.floor((remainingMs % (1000 * 60 * 60)) / (1000 * 60));
+  const secondsLeft = Math.floor((remainingMs % (1000 * 60)) / 1000);
+
+  const elapsedMs = Math.max(0, currentTime - plantedTimestamp);
+  const progressPercent = Math.min(100, Math.max(0, (elapsedMs / VESTING_DURATION_MS) * 100));
+
+  const isCountdownOver = remainingMs === 0;
+  const isCaptureUnlocked = isCountdownOver || forceTestMode || Boolean(selectedTree?.survivalVerified);
 
   // Real-time live mathematical delta calculation
   const dLat = (currentGps.latitude - baselineGps.latitude) * 111320;
@@ -181,7 +230,7 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
   const handleRefreshGps = () => {
     setIsGpsLoading(true);
     soundManager.playScanTick();
-    if (navigator.geolocation) {
+    if (typeof window !== 'undefined' && navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
         (pos) => {
           setCurrentGps({
@@ -206,7 +255,7 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
   };
 
   const handleExecuteSurvivalAudit = async () => {
-    if (!day30Photo) {
+    if (!day30Photo || !selectedTree) {
       soundManager.playScanTick();
       return;
     }
@@ -246,9 +295,30 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
         colors: ['#10b981', '#34d399', '#f59e0b', '#3b82f6', '#ec4899']
       });
 
+      // Update local storage tree
+      updateLocalTree(selectedTree.code, {
+        survivalVerified: true,
+        status: 'healthy',
+        unlockedTokens: result.unlockedAmount || 80,
+        lockedTokens: 0,
+        growthHistory: [
+          ...(selectedTree.growthHistory || []),
+          {
+            day: 30,
+            imageUrl: day30Photo,
+            note: 'Day 30 Survival Verification'
+          }
+        ]
+      });
+
       // Unlock in Firestore
       if (selectedTree.id) {
-        unlockTreeTokensInFirestore(selectedTree.id, selectedTree.planterUid || 'user-1', result.unlockedAmount || 80, result);
+        unlockTreeTokensInFirestore(
+          selectedTree.id,
+          selectedTree.planterUid || 'planter-steward',
+          result.unlockedAmount || 80,
+          result
+        );
       }
 
       if (onEarnPoints) {
@@ -259,28 +329,37 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
     }
   };
 
-  // If no plantations recorded yet
-  if (realTrees.length === 0 && !loading) {
+  // Safe Guard: If no plantations recorded yet
+  if (realTrees.length === 0) {
     return (
       <div className="relative min-h-screen pt-28 pb-20 px-4 max-w-xl mx-auto flex flex-col items-center justify-center text-center space-y-6">
-        <div className="w-16 h-16 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-3xl">
+        <div className="w-20 h-20 rounded-3xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-4xl shadow-xl shadow-emerald-500/10">
           🌱
         </div>
         <div className="space-y-2">
-          <h2 className="text-2xl font-bold text-white tracking-tight">No Active Plantations Found</h2>
-          <p className="text-xs sm:text-sm text-slate-400 font-mono">
-            You must first record a tree in "Plant & Verify" with 3-layer photographic evidence and GPS coordinates to track 30-day survival.
+          <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full border border-emerald-500/30 bg-emerald-950/40 text-emerald-300 text-xs font-mono">
+            <Clock className="w-3.5 h-3.5 text-emerald-400" />
+            <span>30-DAY VESTING ESCROW</span>
+          </div>
+          <h2 className="text-2xl sm:text-3xl font-bold text-white tracking-tight">No Registered Trees Found</h2>
+          <p className="text-xs sm:text-sm text-slate-400 font-mono leading-relaxed">
+            You must first record a tree in "Plant New Tree" with 3-layer photographic evidence and GPS locking. Your 30-day survival countdown and token vesting will then begin automatically.
           </p>
         </div>
         <button
           onClick={() => onNavigate && onNavigate('verify')}
-          className="px-6 py-3 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-400 text-black font-extrabold text-xs font-mono shadow-xl transition-all hover:scale-105 cursor-pointer flex items-center gap-2"
+          className="px-6 py-3.5 rounded-2xl bg-gradient-to-r from-emerald-500 to-teal-400 text-black font-extrabold text-xs font-mono shadow-xl transition-all hover:scale-105 cursor-pointer flex items-center gap-2"
         >
           <Sprout className="w-4 h-4" />
-          <span>+ Plant a Tree to Start 30-Day Vesting</span>
+          <span>+ Plant Your First Tree to Start Vesting</span>
         </button>
       </div>
     );
+  }
+
+  // Guaranteed non-null selectedTree
+  if (!selectedTree) {
+    return null;
   }
 
   return (
@@ -295,7 +374,7 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
           Verify Tree Survival & <span className="text-transparent bg-clip-text bg-gradient-to-r from-emerald-400 to-mint">Unlock Tokens</span>
         </h1>
         <p className="text-slate-400 text-xs sm:text-sm mt-2 font-mono max-w-2xl mx-auto">
-          Tokens are locked upon plantation. Upload Day 30 photographic proof with matching GPS & altitude to prove longitudinal survival and unlock full GreenPoint rewards.
+          Tokens are locked upon plantation. After the 30-day biological growth countdown, submit matching photographic proof and GPS fix to prove survival and unlock full GreenPoint rewards.
         </p>
       </div>
 
@@ -314,7 +393,7 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
               </span>
             </div>
             <p className="text-[11px] text-slate-400 font-sans mt-0.5">
-              Automated 30-day longitudinal growth & survival analysis using system credentials
+              Automated 30-day longitudinal growth & survival analysis with geodetic re-verification
             </p>
           </div>
         </div>
@@ -324,63 +403,78 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
         </div>
       </div>
 
-      {/* Tree Selector Ribbon from Real Planted History (Horizontally swipeable on mobile) */}
-      <div className="p-3 sm:p-4 rounded-2xl glass-panel border border-emerald-500/20 max-w-4xl mx-auto">
-        <div className="text-xs font-mono text-emerald-400 mb-2 flex items-center justify-between">
-          <span className="flex items-center gap-1.5">
-            <Sprout className="w-4 h-4 shrink-0" />
-            <span className="truncate">Select Tree for Day 30 Check:</span>
-          </span>
-          <span className="text-slate-400 text-[11px] shrink-0">{realTrees.length} Plantations</span>
+      {/* Registered Trees Selector Ribbon & Dropdown */}
+      <div className="p-4 sm:p-5 rounded-2xl glass-panel border border-emerald-500/25 max-w-5xl mx-auto bg-black/60 space-y-3 shadow-xl">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+          <div className="flex items-center gap-2 text-xs font-mono text-emerald-400">
+            <Sprout className="w-4 h-4 text-emerald-400 shrink-0" />
+            <span className="font-bold">REGISTERED SPECIMEN SELECTOR:</span>
+          </div>
+          <div className="text-xs font-mono text-slate-400">
+            Specimen <span className="text-emerald-400 font-bold">{selectedTreeIndex + 1}</span> of {realTrees.length} Registered Trees
+          </div>
         </div>
 
-        {realTrees.length === 0 ? (
-          <div className="p-6 rounded-xl bg-black/40 border border-dashed border-emerald-500/20 text-center space-y-3">
-            <p className="text-xs text-slate-300 font-mono">
-              You haven't recorded any tree plantations yet. Plant your first tree to start your 30-day token vesting escrow!
-            </p>
-            <button
-              onClick={() => onNavigate && onNavigate('verify')}
-              className="px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black font-extrabold text-xs font-mono transition-all cursor-pointer shadow-lg shadow-emerald-500/20 inline-flex items-center gap-2"
-            >
-              <Sprout className="w-4 h-4" />
-              <span>+ Plant a Tree Now</span>
-            </button>
-          </div>
-        ) : (
-          <div className="flex sm:grid sm:grid-cols-3 gap-2.5 overflow-x-auto sm:overflow-visible pb-1 sm:pb-0 scrollbar-none">
-            {realTrees.slice(0, 6).map((tree, idx) => (
-              <button
-                key={tree.id || tree.code || idx}
-                onClick={() => {
-                  setSelectedTreeIndex(idx);
-                  setAuditResult(null);
-                  setTokensUnlocked(false);
-                  soundManager.playLeafHover();
-                }}
-                className={`min-w-[240px] sm:min-w-0 p-3 rounded-xl border text-left font-mono transition-all cursor-pointer shrink-0 sm:shrink active:scale-[0.98] ${
-                  selectedTreeIndex === idx
-                    ? 'bg-emerald-950/40 border-emerald-400 ring-2 ring-emerald-500/30 text-white shadow-lg shadow-emerald-500/10'
-                    : 'bg-black/40 border-white/5 text-slate-400 hover:text-white'
-                }`}
-              >
-                <div className="flex items-center justify-between">
-                  <span className="font-bold text-xs text-emerald-400">{tree.code}</span>
-                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20">
-                    {tree.survivalVerified ? '✅ Surviving' : '🔒 30 GP Locked'}
-                  </span>
-                </div>
-                <div className="text-xs font-semibold text-white mt-1 truncate">{tree.species}</div>
-                <div className="text-[10px] text-slate-400 truncate mt-0.5">{tree.locationName}</div>
-              </button>
+        {/* Dropdown for All Registered Trees */}
+        <div className="relative">
+          <select
+            value={selectedTreeIndex}
+            onChange={(e) => {
+              setSelectedTreeIndex(Number(e.target.value));
+              setAuditResult(null);
+              setTokensUnlocked(false);
+              setDay30Photo('');
+              setForceTestMode(false);
+              soundManager.playLeafHover();
+            }}
+            className="w-full px-4 py-3 rounded-xl bg-black/80 border border-emerald-500/40 text-white font-mono text-xs focus:outline-none focus:border-emerald-400 cursor-pointer appearance-none shadow-inner"
+          >
+            {realTrees.map((tree, idx) => (
+              <option key={tree.code || idx} value={idx} className="bg-slate-900 text-white">
+                [{tree.code}] {tree.species} • Planted: {tree.plantedDate} • {tree.survivalVerified ? '✅ Surviving (Unlocked)' : '🔒 30d Vesting Locked'}
+              </option>
             ))}
+          </select>
+          <div className="pointer-events-none absolute inset-y-0 right-0 flex items-center px-4 text-emerald-400">
+            <ChevronDown className="w-4 h-4" />
           </div>
-        )}
+        </div>
+
+        {/* Quick-Switch Visual Cards (Horizontally swipeable on mobile) */}
+        <div className="flex sm:grid sm:grid-cols-3 gap-2.5 overflow-x-auto sm:overflow-visible pb-1 sm:pb-0 scrollbar-none pt-1">
+          {realTrees.slice(0, 6).map((tree, idx) => (
+            <button
+              key={tree.id || tree.code || idx}
+              onClick={() => {
+                setSelectedTreeIndex(idx);
+                setAuditResult(null);
+                setTokensUnlocked(false);
+                setDay30Photo('');
+                setForceTestMode(false);
+                soundManager.playLeafHover();
+              }}
+              className={`min-w-[240px] sm:min-w-0 p-3 rounded-xl border text-left font-mono transition-all cursor-pointer shrink-0 sm:shrink active:scale-[0.98] ${
+                selectedTreeIndex === idx
+                  ? 'bg-emerald-950/40 border-emerald-400 ring-2 ring-emerald-500/30 text-white shadow-lg shadow-emerald-500/10'
+                  : 'bg-black/40 border-white/5 text-slate-400 hover:text-white'
+              }`}
+            >
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-xs text-emerald-400">{tree.code}</span>
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20">
+                  {tree.survivalVerified ? '✅ Surviving' : '🔒 30 GP Locked'}
+                </span>
+              </div>
+              <div className="text-xs font-semibold text-white mt-1 truncate">{tree.species}</div>
+              <div className="text-[10px] text-slate-400 truncate mt-0.5">{tree.locationName}</div>
+            </button>
+          ))}
+        </div>
       </div>
 
-      {/* Main Side-by-Side Comparison Container */}
-      <div className="p-6 sm:p-8 rounded-3xl glass-panel border border-emerald-500/30 max-w-5xl mx-auto shadow-2xl bg-black/60 space-y-6">
-        {/* Header with Token Status */}
+      {/* Main 30-Day Maturation & Verification Container */}
+      <div className="p-5 sm:p-8 rounded-3xl glass-panel border border-emerald-500/30 max-w-5xl mx-auto shadow-2xl bg-black/60 space-y-6">
+        {/* Header with Tree Details and Token Status */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-4 border-b border-emerald-500/20 gap-3">
           <div>
             <span className="text-[10px] font-mono text-emerald-400 uppercase">SUBJECT TREE SPECIMEN:</span>
@@ -392,17 +486,74 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
 
           {/* Token Vesting Status Badge */}
           <div className="flex items-center gap-2">
-            {tokensUnlocked ? (
-              <div className="px-4 py-2 rounded-xl bg-emerald-500/20 border border-emerald-400 text-emerald-300 text-xs font-mono font-bold flex items-center gap-2">
+            {tokensUnlocked || selectedTree.survivalVerified ? (
+              <div className="px-4 py-2 rounded-xl bg-emerald-500/20 border border-emerald-400 text-emerald-300 text-xs font-mono font-bold flex items-center gap-2 shadow-lg shadow-emerald-500/20">
                 <Unlock className="w-4 h-4 text-emerald-400" />
-                <span>UNLOCKED: +{unlockedAmount} GreenPoints in Wallet</span>
+                <span>UNLOCKED: +{selectedTree.unlockedTokens || unlockedAmount || 80} GreenPoints in Wallet</span>
               </div>
             ) : (
               <div className="px-4 py-2 rounded-xl bg-amber-500/20 border border-amber-400/40 text-amber-300 text-xs font-mono font-bold flex items-center gap-2 animate-pulse">
                 <Lock className="w-4 h-4 text-amber-400" />
-                <span>LOCKED: 30 GP Pending 30-Day Living Proof</span>
+                <span>LOCKED: 30 GP Staked in 30-Day Escrow</span>
               </div>
             )}
+          </div>
+        </div>
+
+        {/* 30-Day Maturation Live Countdown HUD */}
+        <div className="p-4 sm:p-5 rounded-2xl bg-black/70 border border-emerald-500/30 font-mono space-y-3 shadow-xl">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+            <div className="flex items-center gap-2 text-slate-200">
+              <Clock className="w-4 h-4 text-amber-400 animate-pulse" />
+              <span className="font-bold text-white">30-DAY BIOLOGICAL MATURATION COUNTDOWN</span>
+            </div>
+            <div className="flex items-center gap-2">
+              {isCaptureUnlocked ? (
+                <span className="px-2.5 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 text-[11px] font-bold border border-emerald-500/40 flex items-center gap-1.5">
+                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>Maturation Period Complete • Capture Unlocked</span>
+                </span>
+              ) : (
+                <span className="px-2.5 py-0.5 rounded-full bg-amber-500/20 text-amber-300 text-[11px] font-bold border border-amber-500/40 flex items-center gap-1.5 animate-pulse">
+                  <Lock className="w-3 h-3 text-amber-400" />
+                  <span>Vesting Active • Capture Locked</span>
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* 4-Box Digital Clock Display */}
+          <div className="grid grid-cols-4 gap-2 sm:gap-3 text-center">
+            <div className="p-3 rounded-xl bg-slate-950/80 border border-emerald-500/20 shadow-inner">
+              <div className="text-2xl sm:text-3xl font-black text-emerald-400 tracking-tight font-mono">{daysLeft}</div>
+              <div className="text-[10px] text-slate-400 uppercase font-sans mt-0.5 tracking-wider font-semibold">Days Left</div>
+            </div>
+            <div className="p-3 rounded-xl bg-slate-950/80 border border-emerald-500/20 shadow-inner">
+              <div className="text-2xl sm:text-3xl font-black text-emerald-400 tracking-tight font-mono">{String(hoursLeft).padStart(2, '0')}</div>
+              <div className="text-[10px] text-slate-400 uppercase font-sans mt-0.5 tracking-wider font-semibold">Hours</div>
+            </div>
+            <div className="p-3 rounded-xl bg-slate-950/80 border border-emerald-500/20 shadow-inner">
+              <div className="text-2xl sm:text-3xl font-black text-emerald-400 tracking-tight font-mono">{String(minutesLeft).padStart(2, '0')}</div>
+              <div className="text-[10px] text-slate-400 uppercase font-sans mt-0.5 tracking-wider font-semibold">Minutes</div>
+            </div>
+            <div className="p-3 rounded-xl bg-slate-950/80 border border-emerald-500/20 shadow-inner">
+              <div className="text-2xl sm:text-3xl font-black text-emerald-400 tracking-tight font-mono">{String(secondsLeft).padStart(2, '0')}</div>
+              <div className="text-[10px] text-slate-400 uppercase font-sans mt-0.5 tracking-wider font-semibold">Seconds</div>
+            </div>
+          </div>
+
+          {/* Progress Bar with Percentage and Elapsed Days */}
+          <div className="space-y-1.5 pt-1">
+            <div className="flex justify-between text-[11px] text-slate-300 font-mono">
+              <span>Growth Maturation: Day {Math.min(30, Math.floor(elapsedMs / 86400000) + 1)} of 30</span>
+              <span className="text-emerald-400 font-bold">{progressPercent.toFixed(1)}% Vested</span>
+            </div>
+            <div className="w-full h-2.5 rounded-full bg-slate-900 border border-white/10 overflow-hidden">
+              <div
+                className="h-full bg-gradient-to-r from-emerald-500 to-teal-400 rounded-full transition-all duration-500"
+                style={{ width: `${progressPercent}%` }}
+              />
+            </div>
           </div>
         </div>
 
@@ -417,166 +568,160 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
               <span className="text-slate-400 text-[11px]">{selectedTree.plantedDate}</span>
             </div>
 
-            <div className="h-64 rounded-xl overflow-hidden relative border border-white/10">
+            <div className="h-72 rounded-xl overflow-hidden relative border border-white/10">
               <img
                 src={
                   selectedTree.growthHistory?.[0]?.imageUrl ||
                   selectedTree.proofPhotos?.layer3Planted ||
+                  selectedTree.proofPhotos?.layer1Soil ||
                   DEFAULT_TREE_FALLBACK
                 }
                 alt="Day 0 Sapling"
                 className="w-full h-full object-cover"
               />
-              <div className="absolute bottom-2 left-2 right-2 bg-black/80 backdrop-blur-md p-2 rounded-lg text-[10px] font-mono text-slate-300 space-y-0.5">
+              <div className="absolute bottom-2 left-2 right-2 bg-black/80 backdrop-blur-md p-2 rounded-lg text-[10px] font-mono text-slate-300 space-y-0.5 border border-white/10">
                 <div>GPS: {baselineGps.latitude}° N, {baselineGps.longitude}° E</div>
-                <div>ALTITUDE: {baselineGps.altitude} m AMSL • HEIGHT: 22 cm</div>
+                <div>ALTITUDE: {baselineGps.altitude} m AMSL • INITIAL SAPLING</div>
               </div>
             </div>
           </div>
-            {/* Day 30 Re-Verification Upload Card */}
-            <div className="rounded-2xl p-4 bg-emerald-950/20 border border-emerald-500/30 space-y-3 relative">
-              <div className="flex items-center justify-between font-mono text-xs">
-                <span className="px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold border border-emerald-500/30">
-                  DAY 30 SURVIVAL PROOF
-                </span>
-                {(selectedTree.daysAlive >= 30 || forceTestMode) && (
-                  <div className="flex items-center gap-1.5 sm:gap-2">
-                    <button
-                      onClick={() => setUseCamera(!useCamera)}
-                      className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-emerald-400 text-xs flex items-center gap-1 cursor-pointer active:scale-95"
-                    >
-                      <Camera className="w-3 h-3" />
-                      <span>{useCamera ? 'Close' : 'Camera'}</span>
-                    </button>
-                    <label className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-slate-200 text-xs flex items-center gap-1 cursor-pointer active:scale-95">
-                      <UploadCloud className="w-3 h-3 text-emerald-400" />
-                      <span>Upload</span>
-                      <input
-                        type="file"
-                        accept="image/*"
-                        capture="environment"
-                        className="hidden"
-                        onChange={handleFileUpload}
-                      />
-                    </label>
-                  </div>
-                )}
-              </div>
 
-              {selectedTree.daysAlive < 30 && !forceTestMode ? (
-                /* Locked 30-Day Maturation Period Screen */
-                <div className="h-64 rounded-xl overflow-hidden relative border border-amber-500/30 bg-black/80 p-6 flex flex-col items-center justify-center text-center space-y-3">
-                  <div className="w-12 h-12 rounded-full bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-amber-400 shadow-lg">
-                    <Lock className="w-6 h-6" />
-                  </div>
-                  <div>
-                    <h4 className="text-white font-bold text-sm font-mono">
-                      30-Day Maturation Lock In Progress
-                    </h4>
-                    <p className="text-slate-400 text-[11px] font-mono mt-1 max-w-xs">
-                      Photo upload & token unlocking are locked until 30 days of growth are completed.
-                    </p>
-                  </div>
+          {/* Day 30 Re-Verification Upload Card */}
+          <div className="rounded-2xl p-4 bg-emerald-950/20 border border-emerald-500/30 space-y-3 relative">
+            <div className="flex items-center justify-between font-mono text-xs">
+              <span className="px-2.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-bold border border-emerald-500/30 flex items-center gap-1.5">
+                {isCaptureUnlocked ? <Unlock className="w-3.5 h-3.5 text-emerald-400" /> : <Lock className="w-3.5 h-3.5 text-amber-400" />}
+                <span>DAY 30 SURVIVAL PROOF</span>
+              </span>
 
-                  {/* Progress Bar */}
-                  <div className="w-full max-w-xs space-y-1">
-                    <div className="flex justify-between text-[10px] font-mono text-slate-300">
-                      <span>Day {selectedTree.daysAlive} of 30</span>
-                      <span className="text-amber-400 font-bold">{Math.max(0, 30 - selectedTree.daysAlive)} Days Left</span>
-                    </div>
-                    <div className="w-full h-2 rounded-full bg-slate-800 overflow-hidden">
-                      <div
-                        className="h-full bg-amber-500 transition-all duration-500"
-                        style={{ width: `${Math.min(100, (selectedTree.daysAlive / 30) * 100)}%` }}
-                      />
-                    </div>
-                  </div>
-
-                  {/* Testing mode toggle */}
+              {/* Capture & Upload buttons are active ONLY when isCaptureUnlocked is true */}
+              {isCaptureUnlocked && (
+                <div className="flex items-center gap-1.5 sm:gap-2">
                   <button
-                    onClick={() => setForceTestMode(true)}
-                    className="mt-1 px-3 py-1.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-[10px] font-mono border border-amber-500/40 cursor-pointer flex items-center gap-1.5 transition-all"
+                    onClick={() => setUseCamera(!useCamera)}
+                    className="px-3 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-emerald-300 text-xs flex items-center gap-1.5 cursor-pointer active:scale-95 font-mono"
                   >
-                    <Sparkles className="w-3 h-3 text-amber-400" />
-                    <span>⚡ Fast-Forward to Day 30 (Test Mode)</span>
+                    <Camera className="w-3.5 h-3.5" />
+                    <span>{useCamera ? 'Close Camera' : '📸 Camera'}</span>
                   </button>
-                </div>
-              ) : (
-                /* Unlocked Day 30 Photo Viewfinder */
-                <div className="h-64 rounded-xl overflow-hidden relative border border-emerald-500/30 bg-black flex items-center justify-center">
-                  {useCamera ? (
-                    <div className="relative w-full h-full">
-                      <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
-                      <button
-                        onClick={handleCapturePhoto}
-                        className="absolute bottom-3 left-1/2 -translate-x-1/2 px-5 py-2 rounded-full bg-emerald-500 text-black font-bold font-mono text-xs shadow-xl cursor-pointer active:scale-95 flex items-center gap-1.5 z-20"
-                      >
-                        📸 Snap Day 30 Proof
-                      </button>
-                    </div>
-                  ) : day30Photo ? (
-                    <div className="relative w-full h-full">
-                      <img src={day30Photo} alt="Day 30 Sapling" className="w-full h-full object-cover" />
-                      <div className="absolute bottom-2 left-2 right-2 bg-black/80 backdrop-blur-md p-2 rounded-lg text-[10px] font-mono text-slate-300 space-y-0.5">
-                        <div className="flex justify-between items-center">
-                          <span>RE-VERIFICATION GPS:</span>
-                          <button
-                            onClick={handleRefreshGps}
-                            disabled={isGpsLoading}
-                            className="text-emerald-400 hover:underline flex items-center gap-1 cursor-pointer"
-                          >
-                            <RefreshCw className={`w-2.5 h-2.5 ${isGpsLoading ? 'animate-spin' : ''}`} />
-                            <span>{isGpsLoading ? 'Syncing...' : 'Sync GPS'}</span>
-                          </button>
-                        </div>
-                        <div>
-                          {currentGps.latitude.toFixed(6)}° N, {currentGps.longitude.toFixed(6)}° E (±{currentGps.accuracy}m)
-                        </div>
-                        <div>ALTITUDE: {currentGps.altitude} m AMSL</div>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="p-6 text-center flex flex-col items-center justify-center space-y-3">
-                      <div className="w-12 h-12 rounded-2xl bg-emerald-500/10 border border-emerald-500/25 flex items-center justify-center text-emerald-400">
-                        <Camera className="w-6 h-6" />
-                      </div>
-                      <div className="space-y-1 max-w-sm">
-                        <h4 className="text-sm font-bold text-white font-mono">
-                          No Day-30 Evidence Photo
-                        </h4>
-                        <p className="text-xs text-slate-400 font-mono">
-                          Snap the living tree at this GPS location to prove 30-day biological survival.
-                        </p>
-                      </div>
-                      <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
-                        <button
-                          onClick={() => setUseCamera(true)}
-                          className="px-4 py-2 rounded-xl bg-emerald-500 text-black font-bold font-mono text-xs hover:bg-emerald-400 cursor-pointer active:scale-95 flex items-center gap-1.5"
-                        >
-                          <Camera className="w-3.5 h-3.5" />
-                          <span>Snap with Camera</span>
-                        </button>
-                        <label className="px-4 py-2 rounded-xl bg-white/10 hover:bg-white/15 border border-white/20 text-white font-mono text-xs cursor-pointer active:scale-95 flex items-center gap-1.5">
-                          <UploadCloud className="w-3.5 h-3.5 text-emerald-400" />
-                          <span>Upload From Gallery</span>
-                          <input
-                            type="file"
-                            accept="image/*"
-                            capture="environment"
-                            className="hidden"
-                            onChange={handleFileUpload}
-                          />
-                        </label>
-                      </div>
-                    </div>
-                  )}
+                  <label className="px-3 py-1 rounded-lg bg-white/10 hover:bg-white/15 border border-white/20 text-white text-xs flex items-center gap-1.5 cursor-pointer active:scale-95 font-mono">
+                    <UploadCloud className="w-3.5 h-3.5 text-emerald-400" />
+                    <span>Upload</span>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      capture="environment"
+                      className="hidden"
+                      onChange={handleFileUpload}
+                    />
+                  </label>
                 </div>
               )}
             </div>
+
+            {!isCaptureUnlocked ? (
+              /* LOCKED VIEW: Maturation Period In Progress */
+              <div className="h-72 rounded-xl overflow-hidden relative border border-amber-500/40 bg-black/85 p-6 flex flex-col items-center justify-center text-center space-y-3">
+                <div className="w-14 h-14 rounded-full bg-amber-500/20 border border-amber-500/40 flex items-center justify-center text-amber-400 shadow-xl animate-pulse">
+                  <Lock className="w-7 h-7" />
+                </div>
+                <div>
+                  <h4 className="text-white font-bold text-sm font-mono flex items-center justify-center gap-1.5">
+                    <span>Camera & Upload Locked</span>
+                  </h4>
+                  <p className="text-slate-300 text-xs font-mono mt-1 max-w-sm leading-relaxed">
+                    Photo capture unlocks automatically when the 30-day countdown reaches zero ({daysLeft}d {hoursLeft}h {minutesLeft}m {secondsLeft}s remaining).
+                  </p>
+                </div>
+
+                {/* Simulator / Fast-Forward Testing Button */}
+                <button
+                  onClick={() => {
+                    setForceTestMode(true);
+                    soundManager.playRewardBurst();
+                  }}
+                  className="mt-2 px-4 py-2 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 text-xs font-mono border border-amber-500/40 cursor-pointer flex items-center gap-2 transition-all hover:scale-105 active:scale-95 shadow-lg shadow-amber-500/10"
+                >
+                  <Sparkles className="w-3.5 h-3.5 text-amber-400" />
+                  <span>⚡ Unlock Day 30 Now (Fast-Forward Test Mode)</span>
+                </button>
+              </div>
+            ) : (
+              /* UNLOCKED VIEW: Camera / Upload / Preview */
+              <div className="h-72 rounded-xl overflow-hidden relative border border-emerald-500/30 bg-black flex items-center justify-center">
+                {useCamera ? (
+                  <div className="relative w-full h-full">
+                    <video ref={videoRef} autoPlay playsInline muted className="w-full h-full object-cover" />
+                    <button
+                      onClick={handleCapturePhoto}
+                      className="absolute bottom-4 left-1/2 -translate-x-1/2 px-6 py-2.5 rounded-full bg-emerald-500 hover:bg-emerald-400 text-black font-extrabold font-mono text-xs shadow-2xl cursor-pointer active:scale-95 flex items-center gap-2 z-20"
+                    >
+                      📸 Snap Day 30 Proof
+                    </button>
+                  </div>
+                ) : day30Photo ? (
+                  <div className="relative w-full h-full">
+                    <img src={day30Photo} alt="Day 30 Specimen" className="w-full h-full object-cover" />
+                    <div className="absolute bottom-2 left-2 right-2 bg-black/85 backdrop-blur-md p-2 rounded-lg text-[10px] font-mono text-slate-300 space-y-0.5 border border-white/10">
+                      <div className="flex justify-between items-center">
+                        <span className="text-emerald-400 font-bold">RE-VERIFICATION GPS FIX:</span>
+                        <button
+                          onClick={handleRefreshGps}
+                          disabled={isGpsLoading}
+                          className="text-emerald-400 hover:underline flex items-center gap-1 cursor-pointer"
+                        >
+                          <RefreshCw className={`w-2.5 h-2.5 ${isGpsLoading ? 'animate-spin' : ''}`} />
+                          <span>{isGpsLoading ? 'Syncing...' : 'Sync GPS'}</span>
+                        </button>
+                      </div>
+                      <div>
+                        {currentGps.latitude.toFixed(6)}° N, {currentGps.longitude.toFixed(6)}° E (±{currentGps.accuracy}m)
+                      </div>
+                      <div>ALTITUDE: {currentGps.altitude} m AMSL</div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="p-6 text-center flex flex-col items-center justify-center space-y-3">
+                    <div className="w-14 h-14 rounded-2xl bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
+                      <Camera className="w-7 h-7" />
+                    </div>
+                    <div className="space-y-1 max-w-sm">
+                      <h4 className="text-sm font-bold text-white font-mono">
+                        Day 30 Capture Unlocked
+                      </h4>
+                      <p className="text-xs text-slate-400 font-mono">
+                        Snap the living tree at this location using camera or upload to run real-time AI survival audit.
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+                      <button
+                        onClick={() => setUseCamera(true)}
+                        className="px-4 py-2 rounded-xl bg-emerald-500 text-black font-bold font-mono text-xs hover:bg-emerald-400 cursor-pointer active:scale-95 flex items-center gap-1.5 shadow-lg shadow-emerald-500/20"
+                      >
+                        <Camera className="w-3.5 h-3.5" />
+                        <span>Snap with Camera</span>
+                      </button>
+                      <label className="px-4 py-2 rounded-xl bg-white/10 hover:bg-white/15 border border-white/20 text-white font-mono text-xs cursor-pointer active:scale-95 flex items-center gap-1.5">
+                        <UploadCloud className="w-3.5 h-3.5 text-emerald-400" />
+                        <span>Upload from Gallery</span>
+                        <input
+                          type="file"
+                          accept="image/*"
+                          capture="environment"
+                          className="hidden"
+                          onChange={handleFileUpload}
+                        />
+                      </label>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
+        </div>
 
         {/* Real-Time Geodetic Telemetry & Delta Matching Radar */}
-        {(selectedTree.daysAlive >= 30 || forceTestMode) && !auditResult && (
+        {isCaptureUnlocked && !auditResult && (
           <div className="p-4 rounded-2xl bg-black/60 border border-white/10 font-mono text-xs space-y-2">
             <div className="text-[11px] text-emerald-400 font-bold flex items-center justify-between">
               <span className="flex items-center gap-1.5">
@@ -651,20 +796,20 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
             {tokensUnlocked && (
               <div className="p-3 rounded-xl bg-emerald-500/20 border border-emerald-400 text-emerald-300 flex items-center justify-between font-bold">
                 <span>🎉 Day 30 Survival Milestone Achieved!</span>
-                <span>+80 GreenPoints Unlocked to Wallet</span>
+                <span>+{unlockedAmount} GreenPoints Unlocked to Wallet</span>
               </div>
             )}
           </div>
-        ) : selectedTree.daysAlive < 30 && !forceTestMode ? (
+        ) : !isCaptureUnlocked ? (
           <div className="space-y-2">
             <button
               disabled
               className="w-full py-4 rounded-2xl bg-slate-900/90 border border-amber-500/30 text-amber-300 font-bold text-sm font-mono flex items-center justify-center gap-2 cursor-not-allowed opacity-90 shadow-inner"
             >
               <Lock className="w-4 h-4 text-amber-400" />
-              <span>🔒 Verification Locked: Unlocks on Day 30 ({30 - selectedTree.daysAlive} Days Left)</span>
+              <span>🔒 Survival Audit Locked: Unlocks in {daysLeft}d {hoursLeft}h {minutesLeft}m {secondsLeft}s</span>
             </button>
-            <p className="text-center text-[10px] text-slate-500 font-mono">
+            <p className="text-center text-[10px] text-slate-400 font-mono">
               Biological maturation protocol: Survival verification opens strictly after 30 full days from planting date.
             </p>
           </div>
@@ -681,12 +826,12 @@ export default function SurvivalCheckView({ onEarnPoints, selectedTreeCode, onNa
             {isAuditing ? (
               <>
                 <RefreshCw className="w-4 h-4 animate-spin" />
-                <span>Auditing Day 30 Temporal Differentials & Altitude...</span>
+                <span>Auditing Day 30 Temporal Differentials & Growth with Gemini AI...</span>
               </>
             ) : !day30Photo ? (
               <>
                 <Camera className="w-4 h-4 text-emerald-400" />
-                <span>📸 Capture or Upload Day-30 Photo Above to Run Audit</span>
+                <span>📸 Capture or Upload Day-30 Photo Above to Run Survival Audit</span>
               </>
             ) : (
               <>

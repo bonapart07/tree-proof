@@ -24,11 +24,35 @@ import {
   onSnapshot,
   subscribeToUserDocument
 } from '@/lib/firebase';
+import { getLocalTrees } from '@/lib/treeStorage';
 import { ShieldCheck, Sprout, Lock, RefreshCw } from 'lucide-react';
 
 export default function Home() {
-  const [currentUser, setCurrentUser] = useState<any>(null);
-  const [authLoading, setAuthLoading] = useState<boolean>(true);
+  const [currentUser, setCurrentUser] = useState<any>(() => {
+    if (typeof window !== 'undefined') {
+      const stored = localStorage.getItem('greenproof_user');
+      if (stored) {
+        try {
+          const parsed = JSON.parse(stored);
+          if (parsed && (parsed.uid || parsed.name)) {
+            return parsed;
+          }
+        } catch (e) {}
+      }
+      const defaultUser = {
+        uid: 'planter-steward',
+        name: 'Green Steward',
+        email: 'steward@greenproof.eco',
+        district: 'Kamrup Metropolitan',
+        state: 'Assam',
+        role: 'citizen'
+      };
+      localStorage.setItem('greenproof_user', JSON.stringify(defaultUser));
+      return defaultUser;
+    }
+    return null;
+  });
+  const [authLoading, setAuthLoading] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<NavTab>('verify');
   const [selectedTreeCode, setSelectedTreeCode] = useState<string>('');
   const [greenPoints, setGreenPoints] = useState<number>(0);
@@ -123,6 +147,20 @@ export default function Home() {
       unsubTrees();
     };
   }, [currentUser?.uid]);
+
+  // Real-time calculation of locked points from local storage trees
+  useEffect(() => {
+    const updateLocalLocked = () => {
+      const trees = getLocalTrees();
+      const locked = trees
+        .filter((t) => !t.survivalVerified)
+        .reduce((acc, t) => acc + (t.lockedTokens ?? 30), 0);
+      setLockedPoints((prev) => Math.max(prev, locked));
+    };
+    updateLocalLocked();
+    window.addEventListener('greenproof_trees_updated', updateLocalLocked);
+    return () => window.removeEventListener('greenproof_trees_updated', updateLocalLocked);
+  }, []);
 
   const handleEarnPoints = async (amount: number) => {
     setGreenPoints((prev) => prev + amount);

@@ -5,6 +5,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import confetti from 'canvas-confetti';
 import { soundManager } from '@/lib/sound';
 import { recordTreeToFirestore, auth, onAuthStateChanged, signInWithGoogleReal } from '@/lib/firebase';
+import { saveLocalTree } from '@/lib/treeStorage';
 import AuthModal from '@/components/ui/AuthModal';
 import { COMPREHENSIVE_SPECIES_LIST, SpeciesItem } from '@/lib/speciesData';
 import { generateDeviceFingerprint, DeviceTelemetry } from '@/lib/deviceFingerprint';
@@ -431,7 +432,7 @@ export default function PlantVerifyView({ onEarnPoints, onNavigate, currentUser:
         plantedAt: Date.now(),
         daysAlive: 1,
         health: result.healthScore || 95,
-        status: 'planted', // Locked in 30-day vesting
+        status: 'planted' as const, // Locked in 30-day vesting
         tokenVestingDays: 30,
         vestingDaysLeft: 30,
         lockedTokens: selectedSpecies.rewardPoints || 30,
@@ -456,10 +457,18 @@ export default function PlantVerifyView({ onEarnPoints, onNavigate, currentUser:
           layer3Planted: result.layer3CanopyValid
         },
         proofPhotos: proofPhotos,
+        growthHistory: [
+          {
+            day: 0,
+            imageUrl: proofPhotos.layer3Planted || proofPhotos.layer1Soil || '',
+            note: 'Day 0 Sapling Baseline'
+          }
+        ],
         txHash: '0x' + Array.from({ length: 40 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
       };
 
       setGeneratedTree(newTreeRecord);
+      saveLocalTree(newTreeRecord); // Guaranteed local storage persistence
       soundManager.playVerifyChime();
       setIsScanning(false);
       setCurrentStep(5);
@@ -483,6 +492,9 @@ export default function PlantVerifyView({ onEarnPoints, onNavigate, currentUser:
       origin: { y: 0.6 },
       colors: ['#10b981', '#34d399', '#059669', '#f59e0b', '#3b82f6']
     });
+    if (generatedTree) {
+      saveLocalTree(generatedTree);
+    }
     const rewardPoints = selectedSpecies.rewardPoints || 30;
     onEarnPoints(rewardPoints);
     setCurrentStep(6);

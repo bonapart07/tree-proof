@@ -39,6 +39,7 @@ import {
   signInWithGoogleReal,
   deleteTreeFromFirestore
 } from '@/lib/firebase';
+import { getLocalTrees, mergeTreesWithLocal, deleteLocalTree } from '@/lib/treeStorage';
 import CanvasWrapper from '@/components/3d/CanvasWrapper';
 import HeroLeafScene, { GrowthStage } from '@/components/3d/HeroLeafScene';
 import AuthModal from '@/components/ui/AuthModal';
@@ -51,7 +52,24 @@ interface UserDashboardViewProps {
 }
 
 export default function UserDashboardView({ onNavigate }: UserDashboardViewProps) {
-  const [currentUser, setCurrentUser] = useState<any>(null);
+  const [currentUser, setCurrentUser] = useState<any>(() => {
+    if (typeof window !== 'undefined') {
+      const stored = localStorage.getItem('greenproof_user');
+      if (stored) {
+        try {
+          return JSON.parse(stored);
+        } catch (e) {}
+      }
+    }
+    return {
+      uid: 'planter-steward',
+      name: 'Green Steward',
+      email: 'steward@greenproof.eco',
+      district: 'Kamrup Metropolitan (Guwahati)',
+      state: 'Assam',
+      role: 'citizen'
+    };
+  });
   const [showAuthModal, setShowAuthModal] = useState(false);
   const [authPromptMessage, setAuthPromptMessage] = useState<string | null>(null);
 
@@ -77,8 +95,13 @@ export default function UserDashboardView({ onNavigate }: UserDashboardViewProps
     survivalRate: 100
   });
 
-  // Start with 0 mock trees: Only show user's real Firestore plantations
-  const [realtimeTrees, setRealtimeTrees] = useState<any[]>([]);
+  // Instant local loading + Real-time Firestore sync
+  const [realtimeTrees, setRealtimeTrees] = useState<any[]>(() => {
+    if (typeof window !== 'undefined') {
+      return getLocalTrees();
+    }
+    return [];
+  });
   const [selectedFilter, setSelectedFilter] = useState<'all' | 'pending' | 'verified'>('all');
   const [loading, setLoading] = useState(false);
 
@@ -118,6 +141,13 @@ export default function UserDashboardView({ onNavigate }: UserDashboardViewProps
 
   // Real-Time Firebase Auth & Firestore Listeners
   useEffect(() => {
+    // 0. Immediately load from localStorage and calculate KPIs
+    const local = getLocalTrees();
+    if (local.length > 0) {
+      setRealtimeTrees(local);
+      calculateStats(local);
+    }
+
     // 1. Check local session storage first
     if (typeof window !== 'undefined') {
       const stored = localStorage.getItem('greenproof_user');
@@ -225,30 +255,31 @@ export default function UserDashboardView({ onNavigate }: UserDashboardViewProps
             });
           }
 
-          let currentDeleted: string[] = [];
-          if (typeof window !== 'undefined') {
-            try {
-              const stored = localStorage.getItem('greenproof_deleted_trees');
-              currentDeleted = stored ? JSON.parse(stored) : [];
-            } catch (e) {}
-          }
-
-          // Only take real trees from Firestore! (No mock trees)
-          const combined = fetchedTrees.filter(
-            (t) => !currentDeleted.includes(t.id) && !currentDeleted.includes(t.code)
-          );
-
+          // Merge local and cloud trees seamlessly with deduplication
+          const combined = mergeTreesWithLocal(fetchedTrees);
           setRealtimeTrees(combined);
           calculateStats(combined);
         },
         (err) => {
-          // Graceful offline/reconnecting fallback
+          // Graceful offline/reconnecting fallback to local storage
+          const localOnly = mergeTreesWithLocal([]);
+          setRealtimeTrees(localOnly);
+          calculateStats(localOnly);
         }
       );
+
+      // Listen for local tree updates (e.g. freshly planted trees)
+      const handleTreesUpdated = () => {
+        const merged = mergeTreesWithLocal([]);
+        setRealtimeTrees(merged);
+        calculateStats(merged);
+      };
+      window.addEventListener('greenproof_trees_updated', handleTreesUpdated);
 
       return () => {
         unsubscribeAuth();
         unsubscribeTrees();
+        window.removeEventListener('greenproof_trees_updated', handleTreesUpdated);
       };
     } catch (err) {
       return () => unsubscribeAuth();
@@ -281,13 +312,10 @@ export default function UserDashboardView({ onNavigate }: UserDashboardViewProps
         await deleteTreeFromFirestore(treeToDelete.id);
       }
 
-      // 2. Persist deletion in local storage for consistent experience
-      const newDeleted = Array.from(
-        new Set([...deletedTreeIds, treeToDelete.id, treeToDelete.code].filter(Boolean))
-      );
-      setDeletedTreeIds(newDeleted);
-      if (typeof window !== 'undefined') {
-        localStorage.setItem('greenproof_deleted_trees', JSON.stringify(newDeleted));
+      // 2. Persist deletion in local storage via unified tree storage manager
+      deleteLocalTree(treeToDelete.code);
+      if (treeToDelete.id) {
+        deleteLocalTree(treeToDelete.id);
       }
 
       // 3. Update active trees state and recalculate dashboard KPIs
